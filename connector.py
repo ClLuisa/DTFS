@@ -1,9 +1,7 @@
 import random
-import json
 
 from config import CONTROL_TYPE
-
-from state_storage import read_last_state_from_state_storage
+from deep_rl import deep_rl_control
 
 CONTROL_ACTIONS = {
     "all_closed": 0, # for winter night
@@ -32,6 +30,9 @@ def return_control(state: dict):
     elif CONTROL_TYPE == "outside_open":
         return -1
 
+    elif CONTROL_TYPE == "deep_rl_run_2":
+        return deep_rl_control(state)
+
 
 def hard_coded_control(state: dict):
         
@@ -53,7 +54,7 @@ def hard_coded_control(state: dict):
             if dry_bulb_temperature < operative_temperature:
                 return CONTROL_ACTIONS["all_open"]     # purge heat (cooling)
             else:
-                CONTROL_ACTIONS["all_closed"]
+                return CONTROL_ACTIONS["all_closed"]
 
     # DAY CASES
     else:
