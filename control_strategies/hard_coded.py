@@ -1,38 +1,4 @@
-import random
-
-from config import CONTROL_TYPE
-from deep_rl import deep_rl_control
-
-CONTROL_ACTIONS = {
-    "all_closed": 0, # for winter night
-    "all_open": 2, # for summer night
-    "inside_open": 1, # for winter day (with radiation)
-    "outside_open": -1 # for summer day
-}
-
-def return_control(state: dict):
-
-    if CONTROL_TYPE == "random":
-        return random_control(state)
-
-    elif CONTROL_TYPE == "hard_coded":
-        return hard_coded_control(state)
-
-    elif CONTROL_TYPE == "all_closed":
-        return 0
-
-    elif CONTROL_TYPE == "all_open":
-        return 2
-    
-    elif CONTROL_TYPE == "inside_open":
-        return 1
-    
-    elif CONTROL_TYPE == "outside_open":
-        return -1
-
-    elif CONTROL_TYPE == "deep_rl_run_2":
-        return deep_rl_control(state)
-
+from config import CONTROL_ACTIONS
 
 def hard_coded_control(state: dict):
         
@@ -42,8 +8,16 @@ def hard_coded_control(state: dict):
     control = state["control"]
 
     wanted_temperature = 21
+    deadband = 0.5
 
-    heating_needed = operative_temperature < wanted_temperature
+    # Only trigger heating/cooling outside the deadband
+    if operative_temperature < wanted_temperature - deadband:
+        heating_needed = True
+    elif operative_temperature > wanted_temperature + deadband:
+        heating_needed = False
+    else:
+        return control  # within deadband, keep current control
+
     is_night = total_horizontal_radiation < 10
 
     if is_night:
@@ -73,13 +47,3 @@ def hard_coded_control(state: dict):
             else:
                 return CONTROL_ACTIONS["all_open"]      # purge / free cooling
 
-    return control
-
-def random_control(state: dict):
-    current_time = state["current_time"]
-    control = state["control"]
-
-    if current_time % 2 == 0:
-        control = random.choice(list(CONTROL_ACTIONS.values()))
-
-    return control
