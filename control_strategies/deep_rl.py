@@ -10,31 +10,17 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 
-from config import STATE_STORAGE_PATH
+from config import RESULTS_PATH
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
+N_OBSERVATIONS = 3
 CONTROL_ACTION_VALUES = [0, 2, 1, -1]
-WANTED_TEMPERATURE = 21.0
-DEADBAND = 0.5
-MODEL_FILENAME = "deep_rl_pytorch_model.pt"
-MODEL_PATH = os.path.join(STATE_STORAGE_PATH, MODEL_FILENAME)
-TRAINING_LOG_PATH = os.path.join(STATE_STORAGE_PATH, "deep_rl_pytorch_training_log.jsonl")
-
-# ---------------------------------------------------------------------------
-# Hyperparameters
-# ---------------------------------------------------------------------------
-BATCH_SIZE = 64
-GAMMA = 0.98
-EPS_START = 0.85
-EPS_END = 0.05
-EPS_DECAY = 2000
-TAU = 0.005
-LR = 3e-4
-
-N_OBSERVATIONS = 4
 N_ACTIONS = len(CONTROL_ACTION_VALUES)
+
+MODEL_FILENAME = "deep_rl_pytorch_model.pt"
+MODEL_PATH = os.path.join(RESULTS_PATH, MODEL_FILENAME)
 
 device = torch.device(
     "cuda" if torch.cuda.is_available() else
@@ -49,8 +35,7 @@ def normalize_state(state: dict) -> torch.Tensor:
     arr = np.array([
         state.get("dry_bulb_temperature", 0.0) / 40.0,
         state.get("total_horizontal_radiation", 0.0) / 1000.0,
-        state.get("operative_temperature", 0.0) / 40.0,
-        state.get("hour_of_day", 0.0),
+        state.get("operative_temperature", 0.0) / 40.0
     ], dtype=np.float32)
     return torch.tensor(arr, device=device).unsqueeze(0)
 
@@ -58,7 +43,6 @@ def normalize_state(state: dict) -> torch.Tensor:
 # Replay memory
 # ---------------------------------------------------------------------------
 Transition = namedtuple("Transition", ("state", "action", "next_state", "reward"))
-
 
 class ReplayMemory:
     def __init__(self, capacity: int = 10_000):
@@ -70,12 +54,73 @@ class ReplayMemory:
     def sample(self, batch_size: int):
         return random.sample(self.memory, batch_size)
 
+    def iter_batches(self, batch_size: int):
+        for start in range(0, len(self.memory), batch_size):
+            chunk = list(self.memory)[start:start + batch_size]
+            if not chunk:
+                continue
+
+            state_batch = torch.cat([t.state for t in chunk])
+            action_batch = torch.cat([t.action for t in chunk])
+            next_state_batch = torch.cat([t.next_state for t in chunk])
+            reward_batch = torch.cat([t.reward for t in chunk])
+
+            yield state_batch, action_batch, next_state_batch, reward_batch
+
     def __len__(self):
         return len(self.memory)
 
-# ---------------------------------------------------------------------------
-# Network
-# ---------------------------------------------------------------------------
+def load_transitions_from_jsonl(
+    filepath: str, 
+    reward_fn=None
+) -> ReplayMemory:
+
+    memory = ReplayMemory()
+    
+    # Read all entries
+    entries = []
+    try:
+        with open(filepath, 'r') as f:
+            for line in f:
+                if line.strip():
+                    entries.append(json.loads(line))
+    except FileNotFoundError:
+        print(f"Warning: File not found: {filepath}")
+        return memory
+    
+    # Create transitions from consecutive entries
+    for i in range(len(entries) - 1):
+        current_entry = entries[i]
+        next_entry = entries[i + 1]
+        
+        current_state = current_entry.get("state", {})
+        next_state = next_entry.get("state", {})
+        action = current_entry.get("control", 0)
+        try:
+            action_index = CONTROL_ACTION_VALUES.index(action)
+        except ValueError:
+            action_index = 0
+        
+        # Normalize states to tensors
+        state_tensor = normalize_state(current_state)
+        next_state_tensor = normalize_state(next_state)
+        
+        # Convert action to tensor
+        action_tensor = torch.tensor([[action_index]], device=device, dtype=torch.long)
+        
+        # Compute reward
+        if reward_fn is not None:
+            reward = reward_fn(current_state, action, next_state, current_entry.get("misc", {}))
+        else:
+            reward = 0.0
+        
+        reward_tensor = torch.tensor([reward], device=device, dtype=torch.float32)
+        
+        # Add transition to memory
+        memory.push(state_tensor, action_tensor, next_state_tensor, reward_tensor)
+    
+    return memory
+
 class DQN(nn.Module):
     def __init__(self, n_observations: int, n_actions: int):
         super().__init__()
@@ -90,54 +135,46 @@ class DQN(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
-# ---------------------------------------------------------------------------
-# Agent
-# ---------------------------------------------------------------------------
 class DeepQAgentTorch:
-    def __init__(self):
+    def __init__(self, checkpoint_path: str, mode: str = "eval"):
+        self.checkpoint_path = checkpoint_path
         self.policy_net = DQN(N_OBSERVATIONS, N_ACTIONS).to(device)
         self.target_net = DQN(N_OBSERVATIONS, N_ACTIONS).to(device)
         self.target_net.load_state_dict(self.policy_net.state_dict())
         self.target_net.eval()
 
-        self.optimizer = optim.AdamW(self.policy_net.parameters(), lr=LR, amsgrad=True)
+        self.mode = mode
+        if self.mode == "eval":
+            self.policy_net.eval()
+
+        self.optimizer = optim.AdamW(self.policy_net.parameters(), lr=3e-4, amsgrad=True)
         self.memory = ReplayMemory(10_000)
 
         self.steps_done = 0
 
         self.last_state: torch.Tensor | None = None
         self.last_action: torch.Tensor | None = None
-        self.last_raw_state: dict | None = None
-
-        self.prev_raw_state: dict | None = None
-        self.prev_action: int | None = None
-
-        # Open training log in append mode
-        self._log_file = open(TRAINING_LOG_PATH, "a", encoding="utf-8")
 
         self._load_model()
 
-    def _log(self, record: dict):
-        """Write a JSON record to the training log file."""
-        self._log_file.write(json.dumps(record) + "\n")
-        self._log_file.flush()
+    def set_mode(self, mode: str):
+        self.mode = mode
+        self.policy_net.train() if mode == "train" else self.policy_net.eval()
 
-    # ------------------------------------------------------------------
-    # Persistence
-    # ------------------------------------------------------------------
     def _save_model(self):
+        os.makedirs(os.path.dirname(self.checkpoint_path), exist_ok=True)
         torch.save({
             "policy_net": self.policy_net.state_dict(),
             "target_net": self.target_net.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "steps_done": self.steps_done,
-        }, MODEL_PATH)
+        }, self.checkpoint_path)
 
     def _load_model(self):
-        if not os.path.exists(MODEL_PATH):
+        if not os.path.exists(self.checkpoint_path):
             return
         try:
-            checkpoint = torch.load(MODEL_PATH, map_location=device)
+            checkpoint = torch.load(self.checkpoint_path, map_location=device)
             self.policy_net.load_state_dict(checkpoint["policy_net"])
             self.target_net.load_state_dict(checkpoint["target_net"])
             self.optimizer.load_state_dict(checkpoint["optimizer"])
@@ -145,75 +182,77 @@ class DeepQAgentTorch:
         except Exception:
             pass
 
-    # ------------------------------------------------------------------
-    # Epsilon
-    # ------------------------------------------------------------------
-    def _epsilon(self) -> float:
-        return EPS_END + (EPS_START - EPS_END) * math.exp(-self.steps_done / EPS_DECAY)
+    def select_action(self, state: dict) -> int:
+        """Eval-mode action: argmax, no exploration, no state mutation."""
+        state_tensor = normalize_state(state)
+        with torch.no_grad():
+            return CONTROL_ACTION_VALUES[int(self.policy_net(state_tensor).max(1).indices.item())]
 
-    def choose_action(self, state: dict) -> int:
+    # ---- online training ----
+    def act_and_remember(self, state: dict) -> int:
+        """Exploratory action for online rollout; tracks last_state/last_action for the next update().
+
+        Returns the actual control signal sent to the environment, but stores the internal
+        network action index for the DQN update.
+        """
         state_tensor = normalize_state(state)
         self.steps_done += 1
-
         epsilon = self._epsilon()
         if random.random() < epsilon:
             action_index = random.randrange(N_ACTIONS)
-            exploratory = True
         else:
             with torch.no_grad():
                 action_index = int(self.policy_net(state_tensor).max(1).indices.item())
-            exploratory = False
 
-        self._log({
-            "type": "action",
-            "step": self.steps_done,
-            "epsilon": round(epsilon, 4),
-            "action_index": action_index,
-            "action_value": CONTROL_ACTION_VALUES[action_index],
-            "exploratory": exploratory,
-            "operative_temperature": state.get("operative_temperature"),
-            "dry_bulb_temperature": state.get("dry_bulb_temperature"),
-            "total_horizontal_radiation": state.get("total_horizontal_radiation"),
-        })
-
-        self.prev_raw_state = self.last_raw_state
-        self.prev_action = (
-            int(self.last_action.item()) if self.last_action is not None else None
-        )
         self.last_state = state_tensor
         self.last_action = torch.tensor([[action_index]], device=device, dtype=torch.long)
-        self.last_raw_state = dict(state)
+        return CONTROL_ACTION_VALUES[action_index]
 
-        return action_index
-
-    # ------------------------------------------------------------------
-    # Online update
-    # ------------------------------------------------------------------
-    def update(self, next_state: dict, reward: float):
-        if self.last_state is None or self.last_action is None:
+    def online_update(self, next_state: dict, reward: float):
+        if self.last_state is None:
             return
-
         next_state_tensor = normalize_state(next_state)
         reward_tensor = torch.tensor([reward], device=device, dtype=torch.float32)
-
         self.memory.push(self.last_state, self.last_action, next_state_tensor, reward_tensor)
-
-        loss = self._optimize()
+        self._optimize()
         self._soft_update_target()
         self._save_model()
 
-        self._log({
-            "type": "update",
-            "step": self.steps_done,
-            "reward": round(reward, 6),
-            "loss": round(loss, 6) if loss is not None else None,
-            "memory_size": len(self.memory),
-        })
+    # ---- offline / batch training ----
+    def offline_update(self, batch):
+        """One gradient step on a pre-sampled batch from the stored dataset (no env interaction)."""
+        state_batch, action_batch, next_state_batch, reward_batch = batch
+        state_action_values = self.policy_net(state_batch).gather(1, action_batch)
+        with torch.no_grad():
+            next_state_values = self.target_net(next_state_batch).max(1).values
+        expected = reward_batch + 0.98 * next_state_values
+        loss = F.smooth_l1_loss(state_action_values, expected.unsqueeze(1))
 
-    # ------------------------------------------------------------------
-    # Mini-batch SGD
-    # ------------------------------------------------------------------
+        # NOTE: plain DQN loss here will overestimate Q-values for actions never
+        # taken from a given state in the logged data (extrapolation error).
+        # Worth adding a CQL-style penalty term before trusting this offline —
+        # happy to sketch that separately if useful.
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        self._soft_update_target()
+
+    def _epsilon(self) -> float:
+
+        EPS_START = 0.85
+        EPS_END = 0.05
+        EPS_DECAY = 1500
+
+        if self.mode == "eval":
+            return 0.0
+        return EPS_END + (EPS_START - EPS_END) * math.exp(-self.steps_done / EPS_DECAY)
+
     def _optimize(self) -> float | None:
+
+        BATCH_SIZE = 64
+        GAMMA = 0.98
+
         if len(self.memory) < BATCH_SIZE:
             return None
 
@@ -252,21 +291,20 @@ class DeepQAgentTorch:
 
         return float(loss.item())
 
-    # ------------------------------------------------------------------
-    # Soft target-network update
-    # ------------------------------------------------------------------
     def _soft_update_target(self):
+        TAU = 0.005
         target_sd = self.target_net.state_dict()
         policy_sd = self.policy_net.state_dict()
         for key in policy_sd:
             target_sd[key] = policy_sd[key] * TAU + target_sd[key] * (1 - TAU)
         self.target_net.load_state_dict(target_sd)
 
-    # ------------------------------------------------------------------
-    # Reward function
-    # ------------------------------------------------------------------
     @staticmethod
     def get_reward(previous_state: dict, next_state: dict, action_index: int) -> float:
+
+        WANTED_TEMPERATURE = 21.0
+        DEADBAND = 0.5
+
         prev_err = abs(previous_state["operative_temperature"] - WANTED_TEMPERATURE)
         next_err = abs(next_state["operative_temperature"] - WANTED_TEMPERATURE)
 
@@ -276,18 +314,3 @@ class DeepQAgentTorch:
         comfort_improvement = prev_err_clipped - next_err_clipped
 
         return float(comfort_improvement)
-
-
-# ---------------------------------------------------------------------------
-# Module-level singleton + public API
-# ---------------------------------------------------------------------------
-_agent = DeepQAgentTorch()
-
-
-def deep_rl_control(state: dict) -> int:
-    if _agent.prev_raw_state is not None and _agent.prev_action is not None:
-        reward = _agent.get_reward(_agent.prev_raw_state, state, _agent.prev_action)
-        _agent.update(state, reward)
-
-    action_index = _agent.choose_action(state)
-    return CONTROL_ACTION_VALUES[action_index]

@@ -11,8 +11,7 @@ INTERVAL_SECONDS = 10 # 1 minute
 
 sys.path.append(r"C:\Users\lkclu\Documents\GitHub\DTFS")
 
-from strategy import return_control
-from state_storage import reset_state_storage, save_state_to_state_storage
+from control import Control
 
 
 while True:
@@ -32,17 +31,16 @@ while True:
             "dry_bulb_temperature": data["OUTDOOR_AIR_TEMP_C"],
             "total_horizontal_radiation": data["SOLAR_RADIATION_VERTICAL_W_M2"],
             "operative_temperature": data["INDOOR_AIR_TEMP_ANALOG_C"],
+        }
+
+        misc = {
             "hour_of_day": dt.hour + dt.minute/60 + dt.second/3600,
-            "control": 0, # replace by correct number
             "current_time": (dt - start_of_year).total_seconds() / 3600
         }
 
-        print('current_state: ', current_state)
-
-        save_state_to_state_storage(current_state)
-
-        next_control_signal = return_control(current_state, control_type="deep_rl")
-        print('next_control_signal: ', next_control_signal)
+        control = Control(data_type="measurements", control_type="random", variant="v1") #replace variant with better name
+        next_control_signal = control.return_control(current_state)
+        control.save_state_to_state_storage({"state": current_state, "control": next_control_signal, "misc": misc})
 
     except Exception as e:
         print(f"Error reading sensors: {e}")
