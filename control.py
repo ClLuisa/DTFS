@@ -72,7 +72,7 @@ class Control(StateStorageMixin, CheckpointMixin):
         elif self.control_type == "outside_open":
             return -1
         elif self.control_type == "deep_rl":
-            return self.agent.select_action(state)
+            return self.agent.select_action(state, misc)
 
 
 class OnlineTrainer(StateStorageMixin, CheckpointMixin):
@@ -117,3 +117,4 @@ class OnlineTrainer(StateStorageMixin, CheckpointMixin):
         )
 
         return control_signal
+

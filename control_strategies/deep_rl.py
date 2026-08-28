@@ -81,11 +81,7 @@ class TrainingMetricsCallback(BaseCallback):
 
 
 def state_to_observation(state: dict) -> np.ndarray:
-    return np.asarray([
-        state.get("dry_bulb_temperature", 0.0) / 40.0,
-        state.get("total_horizontal_radiation", 0.0) / 1000.0,
-        state.get("operative_temperature", 0.0) / 40.0,
-    ], dtype=np.float32)
+    return SimulationEnv.observation(state)
 
 
 class ReplayMemory:
@@ -121,6 +117,8 @@ class DeepQAgentTorch:
         self.model.set_logger(configure(folder=None, format_strings=[]))
         self.last_state = None
         self.last_action = None
+        self._previous_temperature = None
+        self._previous_action = 0
 
     def _model_path(self):
         return self.checkpoint_path.removesuffix(".pt")
@@ -128,12 +126,15 @@ class DeepQAgentTorch:
     def _load_or_create(self):
         model_path = self._model_path()
         if os.path.isfile(model_path + ".zip") and os.path.getsize(model_path + ".zip") > 0:
-            return PersistentDQN.load(model_path, env=self.env, device="auto")
+            try:
+                return PersistentDQN.load(model_path, env=self.env, device="auto")
+            except (RuntimeError, ValueError, KeyError):
+                pass
         return PersistentDQN(
             "MlpPolicy", self.env,
             learning_rate=3e-4, buffer_size=10_000, learning_starts=64,
             batch_size=64, train_freq=1, gradient_steps=1,
-            target_update_interval=250,
+            gamma=0.99, tau=1.0, target_update_interval=250,
             exploration_initial_eps=0.85, exploration_final_eps=0.05,
             exploration_fraction=0.25, policy_kwargs={"net_arch": [64, 64]},
             verbose=0, device="auto",
@@ -162,10 +163,14 @@ class DeepQAgentTorch:
         self.model.save(temporary_path)
         os.replace(temporary_path, model_path + ".zip")
 
-    def select_action(self, state: dict) -> int:
-        action, _ = self.model.predict(state_to_observation(state), deterministic=True)
+    def select_action(self, state: dict, misc=None) -> int:
+        action, _ = self.model.predict(
+            state_to_observation(state),
+            deterministic=True,
+        )
+        action_value = CONTROL_ACTION_VALUES[int(action)]
         self.last_decision_info = {"source": "learned", "epsilon": 0.0, "hold_steps_remaining": 0}
-        return CONTROL_ACTION_VALUES[int(action)]
+        return action_value
 
     def offline_update(self, batch):
         for transition in batch:

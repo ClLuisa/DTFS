@@ -9,6 +9,7 @@ from gymnasium import spaces
 
 
 CONTROL_ACTION_VALUES = (0, 2, 1, -1)
+OBSERVATION_SIZE = 3
 
 
 class SimulationEnv(gym.Env):
@@ -22,14 +23,16 @@ class SimulationEnv(gym.Env):
 
     def __init__(self, action_provider=None, reward: str = "default",
                  comfort_band: tuple[float, float] = (20.5, 21.5),
-                 comfort_bonus: float = 1.0, action_hold_mode: bool = False,
+                 comfort_bonus: float = 1.0, comfort_penalty_scale: float = 1.0,
+                 improvement_scale: float = 0.25, weather_temperature_scale: float = 0.1,
+                 weather_radiation_scale: float = 0.2, action_hold_mode: bool = False,
                  min_hold_steps: int = 1, max_hold_steps: int = 15,
                  hold_probability: float = 0.8, late_max_hold_steps: int = 2,
                  late_hold_probability: float = 0.1,
                  training_timesteps: int | None = None):
         super().__init__()
-        if reward not in {"default", "comfort_band"}:
-            raise ValueError("reward must be 'default' or 'comfort_band'")
+        if reward not in {"default", "comfort_band", "scaled_comfort", "dense_comfort", "weather_adjusted"}:
+            raise ValueError("unknown reward mode")
         if comfort_band[0] >= comfort_band[1]:
             raise ValueError("comfort_band must be ordered (lower, upper)")
         if min_hold_steps < 1 or max_hold_steps < min_hold_steps:
@@ -40,6 +43,10 @@ class SimulationEnv(gym.Env):
         self.reward_mode = reward
         self.comfort_band = comfort_band
         self.comfort_bonus = comfort_bonus
+        self.comfort_penalty_scale = comfort_penalty_scale
+        self.improvement_scale = improvement_scale
+        self.weather_temperature_scale = weather_temperature_scale
+        self.weather_radiation_scale = weather_radiation_scale
         self.action_hold_mode = action_hold_mode
         self.min_hold_steps = min_hold_steps
         self.max_hold_steps = max_hold_steps
@@ -49,10 +56,11 @@ class SimulationEnv(gym.Env):
         self.training_timesteps = training_timesteps
         self._held_action = None
         self._hold_remaining = 0
+        self._hold_elapsed = 0
         self.action_space = spaces.Discrete(len(CONTROL_ACTION_VALUES))
         self.observation_space = spaces.Box(
-            low=np.full(3, -100.0, dtype=np.float32),
-            high=np.full(3, 100.0, dtype=np.float32),
+            low=np.full(OBSERVATION_SIZE, -100.0, dtype=np.float32),
+            high=np.full(OBSERVATION_SIZE, 100.0, dtype=np.float32),
             dtype=np.float32,
         )
         self._condition = Condition()
@@ -67,7 +75,8 @@ class SimulationEnv(gym.Env):
         self.last_decision_info = {}
 
     @staticmethod
-    def observation(state: dict) -> np.ndarray:
+    def observation(state: dict, misc=None, previous_temperature=None,
+                    previous_action=0, hold_duration=0) -> np.ndarray:
         return np.asarray([
             state.get("dry_bulb_temperature", 0.0) / 40.0,
             state.get("total_horizontal_radiation", 0.0) / 1000.0,
@@ -86,7 +95,8 @@ class SimulationEnv(gym.Env):
                     self._condition.wait()
             if self._closed:
                 raise RuntimeError("SimulationEnv was closed")
-            return self.observation(self._state), dict(self._misc)
+            self._hold_elapsed = 0
+            return self.observation(self._state, self._misc), dict(self._misc)
 
     def step(self, action):
         with self._condition:
@@ -102,7 +112,13 @@ class SimulationEnv(gym.Env):
             self._misc = self._next_misc
             self._next_state = None
             reward = self._reward(previous_state, self._state)
-            return self.observation(self._state), reward, False, False, dict(self._misc)
+            return self.observation(
+                self._state,
+                self._misc,
+                previous_temperature=previous_state["operative_temperature"],
+                previous_action=CONTROL_ACTION_VALUES[int(action)],
+                hold_duration=self._hold_elapsed,
+            ), reward, False, False, dict(self._misc)
 
     def submit_state(self, state: dict, misc=None) -> int:
         """Submit a TRNSYS state and wait for SB3's action for it."""
@@ -143,6 +159,7 @@ class SimulationEnv(gym.Env):
             return int(action)
         if self._hold_remaining:
             self._hold_remaining -= 1
+            self._hold_elapsed += 1
             self.last_decision_info = {
                 "source": "held",
                 "epsilon": float(epsilon),
@@ -164,8 +181,10 @@ class SimulationEnv(gym.Env):
             duration = random.randint(self.min_hold_steps, max(self.min_hold_steps, maximum))
             self._held_action = selected_action
             self._hold_remaining = duration - 1
+            self._hold_elapsed = 1
         else:
             self._held_action = None
+            self._hold_elapsed = 0
         self.last_decision_info = {
             "source": source,
             "epsilon": float(epsilon),
@@ -175,10 +194,37 @@ class SimulationEnv(gym.Env):
 
     def _reward(self, previous_state: dict, next_state: dict) -> float:
         target = 21.0
-        reward = abs(previous_state["operative_temperature"] - target)
-        reward -= abs(next_state["operative_temperature"] - target)
+        previous_error = abs(previous_state["operative_temperature"] - target)
+        next_temperature = next_state["operative_temperature"]
+        next_error = abs(next_temperature - target)
+        reward = previous_error - next_error
         if self.reward_mode == "comfort_band":
-            next_temperature = next_state["operative_temperature"]
+            if self.comfort_band[0] <= next_temperature <= self.comfort_band[1]:
+                reward += self.comfort_bonus
+        elif self.reward_mode == "scaled_comfort":
+            if self.comfort_band[0] <= next_temperature <= self.comfort_band[1]:
+                reward = self.comfort_bonus
+            else:
+                distance = min(
+                    abs(next_temperature - self.comfort_band[0]),
+                    abs(next_temperature - self.comfort_band[1]),
+                )
+                reward = -self.comfort_penalty_scale * distance
+                reward += self.improvement_scale * (previous_error - next_error)
+        elif self.reward_mode == "dense_comfort":
+            reward = self.comfort_bonus - min(next_error, 5.0)
+        elif self.reward_mode == "weather_adjusted":
+            previous_outdoor = previous_state.get("dry_bulb_temperature", 0.0)
+            next_outdoor = next_state.get("dry_bulb_temperature", previous_outdoor)
+            previous_radiation = previous_state.get("total_horizontal_radiation", 0.0)
+            next_radiation = next_state.get("total_horizontal_radiation", previous_radiation)
+            expected_weather_change = (
+                self.weather_temperature_scale * (next_outdoor - previous_outdoor)
+                + self.weather_radiation_scale * (next_radiation - previous_radiation) / 1000.0
+            )
+            target_direction = np.sign(target - previous_state["operative_temperature"])
+            weather_credit = target_direction * expected_weather_change
+            reward = self.improvement_scale * (previous_error - next_error - weather_credit)
             if self.comfort_band[0] <= next_temperature <= self.comfort_band[1]:
                 reward += self.comfort_bonus
         return float(reward)
