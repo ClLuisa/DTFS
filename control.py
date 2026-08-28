@@ -1,9 +1,11 @@
 import os, json
+from threading import Thread
 from config import RESULTS_PATH
 
 from control_strategies.hard_coded import hard_coded_control
 from control_strategies.random import random_control
-from control_strategies.deep_rl import DeepQAgentTorch, load_transitions_from_jsonl
+from control_strategies.deep_rl import DeepQAgentTorch
+from connect_protocols.simulation_env import SimulationEnv
 
 
 class CheckpointMixin:
@@ -34,7 +36,9 @@ class StateStorageMixin:
 
 class Control(StateStorageMixin, CheckpointMixin):
     def __init__(self, data_type: str, control_type: str, training_type: str | None = None,
-                 training_source: str | None = None, run_name: str = "default", results_path=RESULTS_PATH):
+                 training_source: str | None = None, run_name: str = "default", results_path=RESULTS_PATH, env=None):
+
+        self.env = env or SimulationEnv()
         self.data_type = data_type
         self.control_type = control_type
         self.training_type = training_type
@@ -45,7 +49,7 @@ class Control(StateStorageMixin, CheckpointMixin):
         self._init_state_storage()
 
         if control_type == "deep_rl":
-            self.agent = DeepQAgentTorch(self._checkpoint_path(), mode="eval")
+            self.agent = DeepQAgentTorch(self._checkpoint_path(), env=self.env)
 
     def _state_storage_path(self):
         if self.control_type == "deep_rl":
@@ -72,44 +76,44 @@ class Control(StateStorageMixin, CheckpointMixin):
 
 
 class OnlineTrainer(StateStorageMixin, CheckpointMixin):
-    def __init__(self, training_source: str, results_path=RESULTS_PATH):
+    def __init__(self, training_source: str, results_path=RESULTS_PATH, env=None,
+                 total_timesteps: int | None = None):
+        if total_timesteps is not None and total_timesteps < 0:
+            raise ValueError("total_timesteps must be non-negative or None")
+
         self.training_type = "online"
         self.training_source = training_source
         self.results_path = results_path
+        self.total_timesteps = total_timesteps
+        self.training_steps = 0
 
         self._init_state_storage()
 
-        self.agent = DeepQAgentTorch(self._checkpoint_path(), mode="train")
+        self.env = env or SimulationEnv()
+        self.agent = DeepQAgentTorch(
+            self._checkpoint_path(),
+            env=self.env,
+        )
+        self.env.action_provider = self.agent.select_action
         self.last_state = None
         self.last_action = None
+        self.learning_thread = None
+        if total_timesteps:
+            self.learning_thread = Thread(
+                target=self.agent.learn, args=(total_timesteps,), daemon=True
+            )
+            self.learning_thread.start()
 
     def _state_storage_path(self):
-        return os.path.join(self.results_path, "models", self.training_type, self.training_source,
-                             f"{self.training_type}.jsonl")
+        return os.path.join(self.results_path, "models", self.training_type, self.training_source, "online.jsonl")
 
     def return_control(self, state: dict, misc=None):
-        if self.last_state is not None and self.last_action is not None:
-            previous_action_index = int(self.last_action.item())
-            reward = self.agent.get_reward(self.last_state, state, previous_action_index)
-            self.agent.online_update(state, reward)
-
-        control_signal = self.agent.act_and_remember(state)
+        control_signal = self.env.submit_state(state, misc)
         self.last_state = state
-        self.last_action = self.agent.last_action
+        self.training_steps = self.agent.model.num_timesteps
+        self.last_decision_info = dict(
+            getattr(self.agent, "last_decision_info", {})
+            or getattr(self.env, "last_decision_info", {})
+        )
 
         return control_signal
-
-
-class OfflineTrainer(CheckpointMixin):
-    def __init__(self, training_source: str, results_path=RESULTS_PATH):
-        self.training_type = "offline"
-        self.training_source = training_source
-        self.results_path = results_path
-        self.agent = DeepQAgentTorch(self._checkpoint_path(), mode="train")
-
-    def train(self, dataset_path: str, n_epochs: int = 100, batch_size: int = 64):
-        dataset = load_transitions_from_jsonl(dataset_path)
-        for epoch in range(n_epochs):
-            for batch in dataset.iter_batches(batch_size):
-                self.agent.offline_update(batch)
-        self.agent._save_model()
