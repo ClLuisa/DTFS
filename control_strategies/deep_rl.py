@@ -12,9 +12,6 @@ import torch.nn.functional as F
 
 from config import RESULTS_PATH
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
 N_OBSERVATIONS = 3
 CONTROL_ACTION_VALUES = [0, 2, 1, -1]
 N_ACTIONS = len(CONTROL_ACTION_VALUES)
@@ -28,9 +25,6 @@ device = torch.device(
     "cpu"
 )
 
-# ---------------------------------------------------------------------------
-# State normalisation
-# ---------------------------------------------------------------------------
 def normalize_state(state: dict) -> torch.Tensor:
     arr = np.array([
         state.get("dry_bulb_temperature", 0.0) / 40.0,
@@ -39,9 +33,6 @@ def normalize_state(state: dict) -> torch.Tensor:
     ], dtype=np.float32)
     return torch.tensor(arr, device=device).unsqueeze(0)
 
-# ---------------------------------------------------------------------------
-# Replay memory
-# ---------------------------------------------------------------------------
 Transition = namedtuple("Transition", ("state", "action", "next_state", "reward"))
 
 class ReplayMemory:
@@ -218,7 +209,7 @@ class DeepQAgentTorch:
         self._soft_update_target()
         self._save_model()
 
-    # ---- offline / batch training ----
+    # ---- offline training ----
     def offline_update(self, batch):
         """One gradient step on a pre-sampled batch from the stored dataset (no env interaction)."""
         state_batch, action_batch, next_state_batch, reward_batch = batch
