@@ -127,7 +127,7 @@ class DeepQAgentTorch:
 
     def _load_or_create(self):
         model_path = self._model_path()
-        if os.path.exists(model_path + ".zip"):
+        if os.path.isfile(model_path + ".zip") and os.path.getsize(model_path + ".zip") > 0:
             return PersistentDQN.load(model_path, env=self.env, device="auto")
         return PersistentDQN(
             "MlpPolicy", self.env,
@@ -150,12 +150,17 @@ class DeepQAgentTorch:
                 callback=TrainingMetricsCallback(metrics_path),
             )
         finally:
-            self._save_model()
-            self.env.set_learning_done()
+            try:
+                self._save_model()
+            finally:
+                self.env.set_learning_done()
 
     def _save_model(self):
         os.makedirs(os.path.dirname(self.checkpoint_path), exist_ok=True)
-        self.model.save(self._model_path())
+        model_path = self._model_path()
+        temporary_path = model_path + ".tmp.zip"
+        self.model.save(temporary_path)
+        os.replace(temporary_path, model_path + ".zip")
 
     def select_action(self, state: dict) -> int:
         action, _ = self.model.predict(state_to_observation(state), deterministic=True)
