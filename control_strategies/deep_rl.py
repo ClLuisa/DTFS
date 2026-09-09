@@ -25,6 +25,9 @@ Transition = namedtuple("Transition", ("state", "action", "next_state", "reward"
 class PersistentDQN(DQN):
     """DQN that applies the environment's action-persistence curriculum."""
 
+    def _excluded_save_params(self):
+        return [*super()._excluded_save_params(), "persistence_env"]
+
     def predict(self, observation, state=None, episode_start=None, deterministic=False):
         environment = getattr(self, "persistence_env", None)
         if not deterministic and environment is not None:
@@ -104,13 +107,14 @@ class ReplayMemory:
 class DeepQAgentTorch:
     """Stable-Baselines3 DQN adapter retaining the existing agent API."""
 
-    def __init__(self, checkpoint_path: str, env=None):
+    def __init__(self, checkpoint_path: str, env=None, require_checkpoint: bool = False):
         if DQN is None:
             raise ImportError(
                 "Deep RL requires gymnasium and stable-baselines3. "
                 "Install them with: pip install gymnasium stable-baselines3[extra]"
             )
         self.checkpoint_path = checkpoint_path
+        self.require_checkpoint = require_checkpoint
         self.env = env or SimulationEnv()
         self.model = self._load_or_create()
         self.model.persistence_env = self.env
@@ -125,11 +129,21 @@ class DeepQAgentTorch:
 
     def _load_or_create(self):
         model_path = self._model_path()
-        if os.path.isfile(model_path + ".zip") and os.path.getsize(model_path + ".zip") > 0:
+        checkpoint_file = model_path + ".zip"
+        checkpoint_exists = os.path.isfile(checkpoint_file) and os.path.getsize(checkpoint_file) > 0
+        if self.require_checkpoint and not checkpoint_exists:
+            raise FileNotFoundError(
+                f"Required DQN checkpoint is missing or empty: {checkpoint_file}. "
+                "Complete training successfully before running evaluation."
+            )
+        if checkpoint_exists:
             try:
                 return PersistentDQN.load(model_path, env=self.env, device="auto")
-            except (RuntimeError, ValueError, KeyError):
-                pass
+            except (RuntimeError, ValueError, KeyError) as error:
+                if self.require_checkpoint:
+                    raise RuntimeError(
+                        f"Could not load DQN checkpoint: {checkpoint_file}"
+                    ) from error
         return PersistentDQN(
             "MlpPolicy", self.env,
             learning_rate=3e-4, buffer_size=10_000, learning_starts=64,

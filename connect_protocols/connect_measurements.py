@@ -7,11 +7,55 @@ import sys
 sys.path.append(r"C:\Users\lkclu\Documents\GitHub\DTFS")
 
 URL = "http://dtaf-core.taild0cac0.ts.net:1880/sensors"
-INTERVAL_SECONDS = 10 # 1 minute
+INTERVAL_SECONDS = 10
 
 sys.path.append(r"C:\Users\lkclu\Documents\GitHub\DTFS")
 
-from control import Control
+from control import Control, OnlineTrainer
+from connect_protocols.simulation_env import SimulationEnv
+
+RUN_MODE = "train"  # "train" or "eval"
+ACTIVE_EXPERIMENT = "drl_ambient_adjusted"
+
+EXPERIMENTS = {
+    "random_control": {"controller": "random", "reward": "default"},
+    "hard_coded_control": {"controller": "hard_coded", "reward": "default"},
+    "drl_ambient_adjusted": {
+        "controller": "deep_rl",
+        "reward": "ambient_adjusted",
+    },
+}
+
+experiment = EXPERIMENTS[ACTIVE_EXPERIMENT]
+simulation_env = SimulationEnv(
+    reward=experiment["reward"],
+    training_timesteps=8_500,
+)
+
+if experiment["controller"] == "deep_rl" and RUN_MODE == "train":
+    control = OnlineTrainer(
+        training_source=ACTIVE_EXPERIMENT,
+        env=simulation_env,
+        total_timesteps=8_500,
+    )
+elif experiment["controller"] == "deep_rl" and RUN_MODE == "eval":
+    control = Control(
+        data_type="measurements",
+        control_type="deep_rl",
+        training_type="online",
+        training_source=ACTIVE_EXPERIMENT,
+        run_name=ACTIVE_EXPERIMENT,
+        env=simulation_env,
+    )
+elif experiment["controller"] in {"random", "hard_coded"}:
+    control = Control(
+        data_type="measurements",
+        control_type=experiment["controller"],
+        run_name=ACTIVE_EXPERIMENT,
+        env=simulation_env,
+    )
+else:
+    raise ValueError("Unsupported RUN_MODE or controller")
 
 
 while True:
@@ -38,9 +82,13 @@ while True:
             "current_time": (dt - start_of_year).total_seconds() / 3600
         }
 
-        control = Control(data_type="measurements", control_type="random", variant="v1") #replace variant with better name
-        next_control_signal = control.return_control(current_state)
-        control.save_state_to_state_storage({"state": current_state, "control": next_control_signal, "misc": misc})
+        next_control_signal = control.return_control(current_state, misc)
+        control.save_state_to_state_storage({
+            "state": current_state,
+            "control": next_control_signal,
+            "misc": misc,
+            "decision": getattr(control, "last_decision_info", {}),
+        })
 
     except Exception as e:
         print(f"Error reading sensors: {e}")

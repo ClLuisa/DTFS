@@ -49,7 +49,11 @@ class Control(StateStorageMixin, CheckpointMixin):
         self._init_state_storage()
 
         if control_type == "deep_rl":
-            self.agent = DeepQAgentTorch(self._checkpoint_path(), env=self.env)
+            self.agent = DeepQAgentTorch(
+                self._checkpoint_path(),
+                env=self.env,
+                require_checkpoint=True,
+            )
 
     def _state_storage_path(self):
         if self.control_type == "deep_rl":
@@ -100,7 +104,7 @@ class OnlineTrainer(StateStorageMixin, CheckpointMixin):
         self.learning_thread = None
         if total_timesteps:
             self.learning_thread = Thread(
-                target=self.agent.learn, args=(total_timesteps,), daemon=True
+                target=self.agent.learn, args=(total_timesteps,), daemon=False
             )
             self.learning_thread.start()
 
@@ -117,4 +121,8 @@ class OnlineTrainer(StateStorageMixin, CheckpointMixin):
         )
 
         return control_signal
+
+    def wait_for_training(self):
+        if self.learning_thread is not None:
+            self.learning_thread.join()
 

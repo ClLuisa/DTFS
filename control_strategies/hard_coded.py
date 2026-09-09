@@ -9,8 +9,8 @@ def hard_coded_control(state: dict):
     total_horizontal_radiation = state["total_horizontal_radiation"]
     operative_temperature = state["operative_temperature"]
 
-    wanted_temperature = 21
-    deadband = 0.5
+    wanted_temperature = 22
+    deadband = 2
 
     if operative_temperature < wanted_temperature - deadband:
         heating_needed = True

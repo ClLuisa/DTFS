@@ -22,7 +22,8 @@ class SimulationEnv(gym.Env):
     metadata = {"render_modes": []}
 
     def __init__(self, action_provider=None, reward: str = "default",
-                 comfort_band: tuple[float, float] = (20.5, 21.5),
+                 comfort_band: tuple[float, float] = (20, 24),
+                 radiation_temperature_scale: float = 500.0,
                  action_hold_mode: bool = False,
                  min_hold_steps: int = 1, max_hold_steps: int = 15,
                  hold_probability: float = 0.8, late_max_hold_steps: int = 2,
@@ -38,6 +39,9 @@ class SimulationEnv(gym.Env):
 
         self.reward_mode = reward
         self.comfort_band = comfort_band
+        if radiation_temperature_scale <= 0:
+            raise ValueError("radiation_temperature_scale must be positive")
+        self.radiation_temperature_scale = radiation_temperature_scale
         self.action_hold_mode = action_hold_mode
         self.min_hold_steps = min_hold_steps
         self.max_hold_steps = max_hold_steps
@@ -189,14 +193,22 @@ class SimulationEnv(gym.Env):
 
         previous_amb_temperature = previous_state["dry_bulb_temperature"]
         next_amb_temperature = next_state["dry_bulb_temperature"]
+        previous_radiation = previous_state.get("total_horizontal_radiation", 0.0)
+        next_radiation = next_state.get("total_horizontal_radiation", previous_radiation)
 
-        inside_comfort_band = self.comfort_band[0] <= next_op_temperature <= self.comfort_band[1]
+        previous_radiation = previous_state["total_horizontal_radiation"]
+        next_radiation = next_state["total_horizontal_radiation"]
 
-        if inside_comfort_band:
-            reward = 10.0
+        last_inside_comfort_band = self.comfort_band[0] <= previous_op_temperature <= self.comfort_band[1]
+        next_inside_comfort_band = self.comfort_band[0] <= next_op_temperature <= self.comfort_band[1]
 
+        if last_inside_comfort_band and not next_inside_comfort_band:
+            reward = -1.0
+        elif not last_inside_comfort_band and next_inside_comfort_band:
+            reward = 1.0
+        elif last_inside_comfort_band and next_inside_comfort_band:
+            reward = 0.05
         else:
-
             previous_error = min(
                 abs(previous_op_temperature - self.comfort_band[0]),
                 abs(previous_op_temperature - self.comfort_band[1]),
@@ -205,33 +217,23 @@ class SimulationEnv(gym.Env):
                 abs(next_op_temperature - self.comfort_band[0]),
                 abs(next_op_temperature - self.comfort_band[1]),
             )
-            reward = previous_error - next_error
-
-        # elif self.reward_mode == "scaled_comfort":
-        #     if self.comfort_band[0] <= next_temperature <= self.comfort_band[1]:
-        #         reward = self.comfort_bonus
-        #     else:
-        #         distance = min(
-        #             abs(next_temperature - self.comfort_band[0]),
-        #             abs(next_temperature - self.comfort_band[1]),
-        #         )
-        #         reward = -self.comfort_penalty_scale * distance
-        #         reward += self.improvement_scale * (previous_error - next_error)
+            reward = float(previous_error - next_error)
 
         if self.reward_mode == "default":
-            pass # no additional modifications
+            pass
 
         if self.reward_mode == "ambient_adjusted":
 
             ambient_temperature_change = next_amb_temperature - previous_amb_temperature
+            radiation_change = next_radiation - previous_radiation
             operative_temperature_change = next_op_temperature - previous_op_temperature
 
             alignment = self._ambient_alignment_factor(
-                ambient_temperature_change, operative_temperature_change
+                ambient_temperature_change,
+                operative_temperature_change,
+                radiation_change=radiation_change,
             )
 
-            # Cap how much the reward can be discounted, so there's always some
-            # learning signal even when ambient/operative move in lockstep.
             max_discount = 0.8
             attribution_weight = 1.0 - max_discount * alignment
 
@@ -243,6 +245,7 @@ class SimulationEnv(gym.Env):
         self,
         ambient_change: float,
         operative_change: float,
+        radiation_change: float = 0.0,
         min_change: float = 0.02,
     ) -> float:
         """
@@ -251,11 +254,16 @@ class SimulationEnv(gym.Env):
         attributable to the flap action). 0 = no shared movement / opposite
         directions, 1 = moved together at the same rate.
         """
+        environmental_change = (
+            ambient_change
+            + radiation_change / self.radiation_temperature_scale
+        )
+
         # Too small to say anything meaningful about direction/rate.
-        if abs(ambient_change) < min_change or abs(operative_change) < min_change:
+        if abs(environmental_change) < min_change or abs(operative_change) < min_change:
             return 0.0
 
-        same_direction = (ambient_change > 0) == (operative_change > 0)
+        same_direction = (environmental_change > 0) == (operative_change > 0)
         if not same_direction:
             # Operative temperature moved opposite to ambient -- if anything, this
             # suggests the flap IS having an effect (working against ambient drift),
@@ -264,8 +272,8 @@ class SimulationEnv(gym.Env):
 
         # Same direction: how closely do the magnitudes match? 1.0 = identical rate
         # of change (fully explained by ambient movement), lower = only partially.
-        magnitude_ratio = min(abs(operative_change), abs(ambient_change)) / max(
-            abs(operative_change), abs(ambient_change)
+        magnitude_ratio = min(abs(operative_change), abs(environmental_change)) / max(
+            abs(operative_change), abs(environmental_change)
         )
         return magnitude_ratio
 
