@@ -239,6 +239,23 @@ class SimulationEnv(gym.Env):
 
             reward *= attribution_weight
 
+        if self.reward_mode == "ambient_adjusted_new":
+
+            ambient_temperature_change = next_amb_temperature - previous_amb_temperature
+            radiation_change = next_radiation - previous_radiation
+            operative_temperature_change = next_op_temperature - previous_op_temperature
+
+            alignment = self._ambient_alignment_factor(
+                ambient_temperature_change,
+                operative_temperature_change,
+                radiation_change=radiation_change,
+            )
+
+            max_discount = 0.8
+            attribution_weight = 1.0 - max_discount * alignment
+
+            reward *= attribution_weight
+
         return reward
 
     def _ambient_alignment_factor(
@@ -265,42 +282,12 @@ class SimulationEnv(gym.Env):
 
         same_direction = (environmental_change > 0) == (operative_change > 0)
         if not same_direction:
-            # Operative temperature moved opposite to ambient -- if anything, this
-            # suggests the flap IS having an effect (working against ambient drift),
-            # so don't discount.
             return 0.0
 
-        # Same direction: how closely do the magnitudes match? 1.0 = identical rate
-        # of change (fully explained by ambient movement), lower = only partially.
         magnitude_ratio = min(abs(operative_change), abs(environmental_change)) / max(
             abs(operative_change), abs(environmental_change)
         )
         return magnitude_ratio
-
-        # previous_error = abs(previous_state["operative_temperature"] - target)
-        # next_error = abs(next_state["operative_temperature"] - target)
-        # reward = previous_error - next_error
-        # if self.reward_mode == "comfort_band":
-        #     if self.comfort_band[0] <= next_temperature <= self.comfort_band[1]:
-        #         reward += self.comfort_bonus
-
-        # elif self.reward_mode == "dense_comfort":
-        #     reward = self.comfort_bonus - min(next_error, 5.0)
-        # elif self.reward_mode == "weather_adjusted":
-        #     previous_outdoor = previous_state.get("dry_bulb_temperature", 0.0)
-        #     next_outdoor = next_state.get("dry_bulb_temperature", previous_outdoor)
-        #     previous_radiation = previous_state.get("total_horizontal_radiation", 0.0)
-        #     next_radiation = next_state.get("total_horizontal_radiation", previous_radiation)
-        #     expected_weather_change = (
-        #         self.weather_temperature_scale * (next_outdoor - previous_outdoor)
-        #         + self.weather_radiation_scale * (next_radiation - previous_radiation) / 1000.0
-        #     )
-        #     target_direction = np.sign(target - previous_state["operative_temperature"])
-        #     weather_credit = target_direction * expected_weather_change
-        #     reward = self.improvement_scale * (previous_error - next_error - weather_credit)
-        #     if self.comfort_band[0] <= next_temperature <= self.comfort_band[1]:
-        #         reward += self.comfort_bonus
-        # return float(reward)
 
     def close(self):
         with self._condition:
