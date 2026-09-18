@@ -22,7 +22,7 @@ class SimulationEnv(gym.Env):
     metadata = {"render_modes": []}
 
     def __init__(self, action_provider=None, reward: str = "default",
-                 comfort_band: tuple[float, float] = (20, 24),
+                 comfort_band: tuple[float, float] = (20, 22, 24),
                  radiation_temperature_scale: float = 500.0,
                  action_hold_mode: bool = False,
                  min_hold_steps: int = 1, max_hold_steps: int = 15,
@@ -30,8 +30,7 @@ class SimulationEnv(gym.Env):
                  late_hold_probability: float = 0.1,
                  training_timesteps: int | None = None):
         super().__init__()
-        if reward not in {"default", "ambient_adjusted"}:
-            raise ValueError("unknown reward mode")
+
         if min_hold_steps < 1 or max_hold_steps < min_hold_steps:
             raise ValueError("hold steps must satisfy 1 <= min <= max")
         if late_max_hold_steps < 1 or not 0 <= hold_probability <= 1 or not 0 <= late_hold_probability <= 1:
@@ -207,22 +206,29 @@ class SimulationEnv(gym.Env):
         elif not last_inside_comfort_band and next_inside_comfort_band:
             reward = 1.0
         elif last_inside_comfort_band and next_inside_comfort_band:
-            reward = 0.05
+            if "sensitive" in self.reward_mode:
+
+                previous_error = abs(previous_op_temperature - self.comfort_band[1])
+                next_error = abs(next_op_temperature - self.comfort_band[1])
+                reward = (float(previous_error - next_error) + 2) / 4
+
+            else:
+                reward = 0.05
         else:
             previous_error = min(
                 abs(previous_op_temperature - self.comfort_band[0]),
-                abs(previous_op_temperature - self.comfort_band[1]),
+                abs(previous_op_temperature - self.comfort_band[2]),
             )
             next_error = min(
                 abs(next_op_temperature - self.comfort_band[0]),
-                abs(next_op_temperature - self.comfort_band[1]),
+                abs(next_op_temperature - self.comfort_band[2]),
             )
             reward = float(previous_error - next_error)
 
-        if self.reward_mode == "default":
+        if "default" in self.reward_mode:
             pass
 
-        if self.reward_mode == "ambient_adjusted":
+        if "ambient_adjusted" in self.reward_mode:
 
             ambient_temperature_change = next_amb_temperature - previous_amb_temperature
             radiation_change = next_radiation - previous_radiation
@@ -239,7 +245,7 @@ class SimulationEnv(gym.Env):
 
             reward *= attribution_weight
 
-        if self.reward_mode == "ambient_adjusted_new":
+        if self.reward_mode == "ambient_adjusted_sensitive":
 
             ambient_temperature_change = next_amb_temperature - previous_amb_temperature
             radiation_change = next_radiation - previous_radiation
