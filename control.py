@@ -92,6 +92,7 @@ class OnlineTrainer(StateStorageMixin, CheckpointMixin):
         self.training_steps = 0
 
         self._init_state_storage()
+        self.reset_state_storage()
 
         self.env = env or SimulationEnv()
         self.agent = DeepQAgentTorch(
