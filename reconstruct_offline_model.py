@@ -14,7 +14,7 @@ STEPS_PER_DAY = 24 * 60 // 10
 # Edit these values before running this file directly.
 SOURCE_METRICS = "drl_ambient_adjusted_measured"
 SOURCE_DIR = fr"results\models\online\{SOURCE_METRICS}"
-DAYS = 7
+DAYS = 28
 OUTPUT_PATH = fr"results\models\offline\{SOURCE_METRICS}_{DAYS}_days\offline_model"
 
 
