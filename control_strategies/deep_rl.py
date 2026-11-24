@@ -1,5 +1,6 @@
 import json
 import os
+import random
 from collections import deque, namedtuple
 
 import numpy as np
@@ -8,12 +9,54 @@ from connect_protocols.simulation_env import SimulationEnv
 
 try:
     from stable_baselines3 import DQN
-    from stable_baselines3.common.callbacks import BaseCallback
+    from stable_baselines3.common.callbacks import BaseCallback, CallbackList, CheckpointCallback
     from stable_baselines3.common.logger import configure
 except ImportError:
     DQN = None
     BaseCallback = object
     configure = None
+
+
+# --- Seed -------------------------------------------------------------------
+# Set the seed for a training run in one of two ways (the first one found wins):
+#   1. DeepQAgentTorch(..., seed=3)
+#   2. environment variable DTFS_SEED, e.g. in PowerShell:  $env:DTFS_SEED = "3"
+#      (or at the top of connect_simulation.py:  os.environ["DTFS_SEED"] = "3")
+# Without a seed, training stays random as before.
+# Use a separate experiment name per seed (e.g. "..._seed3"), otherwise the
+# checkpoint of the previous run is loaded and training continues from it.
+SEED_ENV_VAR = "DTFS_SEED"
+
+# --- Training settings that can be changed per run ------------------------
+# DTFS_BUFFER_SIZE: replay buffer size. Default 1_000_000 keeps ALL experience of
+#   a multi-year run. Runs shorter than 10_000 steps (e.g. the 2-month agents with
+#   8_500 steps) behave exactly as before, because the old buffer (10_000) never filled.
+# DTFS_GAMMA: discount factor (default 0.99 = previous setting).
+# DTFS_CHECKPOINT_EVERY: save an extra model every N steps (0 = off), e.g. 8760*6//2
+#   to compare a half-year model with the final one (detects forgetting).
+BUFFER_SIZE = int(os.environ.get("DTFS_BUFFER_SIZE", "1000000"))
+GAMMA = float(os.environ.get("DTFS_GAMMA", "0.99"))
+CHECKPOINT_EVERY = int(os.environ.get("DTFS_CHECKPOINT_EVERY", "0"))
+
+
+def resolve_seed(seed=None):
+    if seed is not None:
+        return int(seed)
+    value = os.environ.get(SEED_ENV_VAR, "").strip()
+    return int(value) if value else None
+
+
+def set_global_seed(seed: int):
+    """Seed Python, NumPy and PyTorch (CPU and GPU)."""
+    random.seed(seed)  # also used by SimulationEnv.resolve_action (action hold)
+    np.random.seed(seed)  # used by PersistentDQN.predict for epsilon-greedy
+    try:
+        import torch
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+    except ImportError:
+        pass
 
 
 CONTROL_ACTION_VALUES = [0, 2, 1, -1]
@@ -107,7 +150,8 @@ class ReplayMemory:
 class DeepQAgentTorch:
     """Stable-Baselines3 DQN adapter retaining the existing agent API."""
 
-    def __init__(self, checkpoint_path: str, env=None, require_checkpoint: bool = False):
+    def __init__(self, checkpoint_path: str, env=None, require_checkpoint: bool = False,
+                 seed: int | None = None):
         if DQN is None:
             raise ImportError(
                 "Deep RL requires gymnasium and stable-baselines3. "
@@ -116,6 +160,11 @@ class DeepQAgentTorch:
         self.checkpoint_path = checkpoint_path
         self.require_checkpoint = require_checkpoint
         self.env = env or SimulationEnv()
+        self.seed = resolve_seed(seed)
+        if self.seed is not None:
+            set_global_seed(self.seed)
+            self.env.action_space.seed(self.seed)
+            self.env.observation_space.seed(self.seed)
         self.model = self._load_or_create()
         self.model.persistence_env = self.env
         self.model.set_logger(configure(folder=None, format_strings=[]))
@@ -137,8 +186,14 @@ class DeepQAgentTorch:
                 "Complete training successfully before running evaluation."
             )
         if checkpoint_exists:
+            if not self.require_checkpoint:
+                print(f"[DeepQAgentTorch] Existing checkpoint found, training CONTINUES from it: {checkpoint_file}. "
+                      "Use a new experiment name (or delete the folder) for a fresh run.")
             try:
-                return PersistentDQN.load(model_path, env=self.env, device="auto")
+                model = PersistentDQN.load(model_path, env=self.env, device="auto")
+                if self.seed is not None:
+                    model.set_random_seed(self.seed)
+                return model
             except (RuntimeError, ValueError, KeyError) as error:
                 if self.require_checkpoint:
                     raise RuntimeError(
@@ -146,23 +201,31 @@ class DeepQAgentTorch:
                     ) from error
         return PersistentDQN(
             "MlpPolicy", self.env,
-            learning_rate=3e-4, buffer_size=10_000, learning_starts=64,
+            learning_rate=3e-4, buffer_size=BUFFER_SIZE, learning_starts=64,
             batch_size=64, train_freq=1, gradient_steps=1,
-            gamma=0.99, tau=1.0, target_update_interval=250,
+            gamma=GAMMA, tau=1.0, target_update_interval=250,
             exploration_initial_eps=0.85, exploration_final_eps=0.05,
             exploration_fraction=0.25, policy_kwargs={"net_arch": [64, 64]},
-            verbose=0, device="auto",
+            verbose=0, device="auto", seed=self.seed,
         )
 
     def learn(self, total_timesteps: int):
         try:
-            metrics_path = os.path.join(
-                os.path.dirname(self.checkpoint_path), "training_metrics.jsonl"
-            )
+            run_dir = os.path.dirname(self.checkpoint_path)
+            metrics_path = os.path.join(run_dir, "training_metrics.jsonl")
+            os.makedirs(run_dir, exist_ok=True)
+            with open(os.path.join(run_dir, "run_info.json"), "w", encoding="utf-8") as f:
+                json.dump({"seed": self.seed, "total_timesteps": total_timesteps,
+                           "buffer_size": int(self.model.buffer_size), "gamma": float(self.model.gamma)}, f, indent=2)
+            callbacks = [TrainingMetricsCallback(metrics_path)]
+            if CHECKPOINT_EVERY > 0:
+                callbacks.append(CheckpointCallback(save_freq=CHECKPOINT_EVERY,
+                                                    save_path=os.path.join(run_dir, "checkpoints"),
+                                                    name_prefix="online_model"))
             self.model.learn(
                 total_timesteps=total_timesteps,
                 reset_num_timesteps=False,
-                callback=TrainingMetricsCallback(metrics_path),
+                callback=CallbackList(callbacks),
             )
         finally:
             try:

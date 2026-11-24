@@ -22,7 +22,7 @@ class SimulationEnv(gym.Env):
     metadata = {"render_modes": []}
 
     def __init__(self, action_provider=None, reward: str = "default",
-                 comfort_band: tuple[float, float] = (20, 22, 24),
+                 comfort_band: tuple[float, float] = (20, 22),
                  radiation_temperature_scale: float = 500.0,
                  action_hold_mode: bool = False,
                  min_hold_steps: int = 1, max_hold_steps: int = 15,
@@ -217,11 +217,11 @@ class SimulationEnv(gym.Env):
         else:
             previous_error = min(
                 abs(previous_op_temperature - self.comfort_band[0]),
-                abs(previous_op_temperature - self.comfort_band[2]),
+                abs(previous_op_temperature - self.comfort_band[1]),
             )
             next_error = min(
                 abs(next_op_temperature - self.comfort_band[0]),
-                abs(next_op_temperature - self.comfort_band[2]),
+                abs(next_op_temperature - self.comfort_band[1]),
             )
             reward = float(previous_error - next_error)
 
@@ -229,23 +229,6 @@ class SimulationEnv(gym.Env):
             pass
 
         if "ambient_adjusted" in self.reward_mode:
-
-            ambient_temperature_change = next_amb_temperature - previous_amb_temperature
-            radiation_change = next_radiation - previous_radiation
-            operative_temperature_change = next_op_temperature - previous_op_temperature
-
-            alignment = self._ambient_alignment_factor(
-                ambient_temperature_change,
-                operative_temperature_change,
-                radiation_change=radiation_change,
-            )
-
-            max_discount = 0.8
-            attribution_weight = 1.0 - max_discount * alignment
-
-            reward *= attribution_weight
-
-        if self.reward_mode == "ambient_adjusted_sensitive":
 
             ambient_temperature_change = next_amb_temperature - previous_amb_temperature
             radiation_change = next_radiation - previous_radiation
